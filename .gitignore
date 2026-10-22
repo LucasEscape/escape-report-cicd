@@ -1,0 +1,6 @@
+.env
+__pycache__/
+# Generated reports (rebuilt by the CI on every run)
+escape-report*.md
+escape-report*.pdf
+.DS_Store

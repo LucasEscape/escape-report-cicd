@@ -1,0 +1,26 @@
+# Placeholder for your staging deployment.
+#
+# Replace the "Deploy" step with your real deployment. Keep the workflow name
+# "Deploy to staging": the Escape scan workflow (escape-scan.yml) starts when a run of
+# this workflow succeeds on main, so the scan never blocks or slows down the deployment.
+
+name: Deploy to staging
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy
+        run: echo "Deploying ${GITHUB_SHA::7} to staging… (replace this step with your real deployment)"
