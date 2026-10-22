@@ -20,6 +20,7 @@ Environment variables (or .env next to the script):
     ESCAPE_API_URL        (optional) defaults to https://public.escape.tech/v3
     ESCAPE_PDF_PATH       (optional) same as --pdf: where to save the Escape PDF report
     ESCAPE_PDF_TIMEOUT    (optional) same as --pdf-timeout (seconds, default 600)
+    ESCAPE_GENERATE_PDF   (optional) true (default) | false: have Escape generate the PDF report or skip it
     GITHUB_STEP_SUMMARY   set by GitHub Actions; the report is appended to the job summary
 
 Exit codes: 0 = OK, 1 = --fail-on threshold reached, 2 = API / usage error,
@@ -618,7 +619,12 @@ def run(charts_cls, default_output, description):
     parser.add_argument("--fail-on", choices=[s.lower() for s in SEVERITIES],
                         help="Exit 1 if an open finding at or above this severity exists (CI gate)")
     parser.add_argument("--full", action="store_true", help="Do not truncate descriptions / remediations")
-    parser.add_argument("--no-report", action="store_true", help="Do not generate the PDF report")
+    pdf_default = os.environ.get("ESCAPE_GENERATE_PDF", "true").strip().lower() not in ("false", "0", "no", "off")
+    parser.set_defaults(generate_pdf=pdf_default)
+    parser.add_argument("--generate-pdf", dest="generate_pdf", action="store_true",
+                        help="Have Escape generate the PDF report (default: true, or ESCAPE_GENERATE_PDF)")
+    parser.add_argument("--no-generate-pdf", "--no-report", dest="generate_pdf", action="store_false",
+                        help="Skip the Escape PDF report, which makes the report faster")
     parser.add_argument("--pdf", metavar="PATH", default=os.environ.get("ESCAPE_PDF_PATH"),
                         help="Where to save the PDF report (default: next to the Markdown, same name .pdf)")
     parser.add_argument("--pdf-timeout", type=int, metavar="SECONDS",
@@ -660,7 +666,7 @@ def run(charts_cls, default_output, description):
                 print(f"⏳ Scan {args.scan} still running after {fmt_duration(args.wait_timeout * 1000)}: "
                       "no report yet (exit 3)", file=sys.stderr)
                 return 3
-        d = collect(api, args.profile, args.scan, not args.no_report, args.pdf_timeout)
+        d = collect(api, args.profile, args.scan, args.generate_pdf, args.pdf_timeout)
     except APIError as e:
         return fail(str(e))
 

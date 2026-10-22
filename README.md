@@ -50,7 +50,7 @@ To preview it like GitHub does, open the file in VS Code with a Mermaid preview 
 | `--wait-timeout <s>` | Stop waiting after this many seconds and exit `3` without a report (default: no limit) |
 | `--fail-on <severity>` | CI gate: exit `1` if an open finding is at or above `critical`, `high`, `medium`, `low` or `info` |
 | `--full` | Don't truncate descriptions and remediations |
-| `--no-report` | Skip PDF report generation (faster) |
+| `--generate-pdf` / `--no-generate-pdf` | Have Escape generate the PDF report, or skip it (faster). Default: generate, or `ESCAPE_GENERATE_PDF` (`true` / `false`). `--no-report` still works |
 | `--pdf <path>` | Where to save the Escape PDF report (default: next to the Markdown file, same name with `.pdf`) |
 | `--pdf-timeout <s>` | How long to wait for Escape to generate the PDF, default `600` |
 | `--output <path>` | Markdown file to write (default: next to the script) |
@@ -111,6 +111,7 @@ In **Settings → Secrets and variables → Actions → Repository** (not *Envir
 |---|---|---|
 | Secret | `ESCAPE_API_KEY` | Escape API key (**required**) |
 | Variable | `ESCAPE_PROFILE_ID` | Profile to scan (**required**) |
+| Variable | `ESCAPE_GENERATE_PDF` | `true` (default when unset) or `false`: have Escape generate the PDF report on automatic runs, or skip it |
 | Variable | `ESCAPE_FAIL_ON` | e.g. `high`: the *Escape scan* run turns red when open findings reach it. Empty = report only |
 
 Permissions used by the workflow: `contents: read`, and `actions: write` to re-dispatch itself and delete old report artifacts. If your organization restricts workflow permissions, allow *Read and write* in *Settings → Actions → General*.
@@ -123,6 +124,7 @@ Permissions used by the workflow: `contents: read`, and `actions: write` to re-d
 |---|---|
 | `scan_id` | Wait for / report on this scan (e.g. a scan started from the Escape UI) |
 | `start_new_scan` | Checked (default): start a new scan. Unchecked: report on the profile's last scan |
+| `generate_pdf` | Checked (default): Escape generates the PDF report. Unchecked: skip it, the report has no PDF link |
 | `profile_id`, `fail_on`, `full` | Override the repository variables for this run |
 
 ### What you get
@@ -132,7 +134,7 @@ Permissions used by the workflow: `contents: read`, and `actions: write` to re-d
 - Two **artifacts**: `escape-report.pdf`, the Escape PDF report as-is (not zipped), downloaded directly by the header's **PDF report** link, and `escape-report-markdown`.
 - Only the **latest** report per branch: each run deletes the report artifacts of the previous runs on the same branch. Artifacts are kept 90 days if no new run replaces them.
 
-If Escape doesn't produce the PDF in time or the download fails, the header says "PDF report n/a" with the reason, and the run continues.
+If Escape doesn't produce the PDF in time or the download fails, the header says "PDF report n/a" with the reason, and the run continues. When PDF generation is turned off, there's no PDF link and no `escape-report.pdf` artifact, and the report is out in seconds.
 
 > ℹ️ Escape locks a profile while one of its scans is running. If a deployment happens meanwhile, Escape may refuse to start the new scan: that run fails with exit `2` and the Escape error message, and the running scan's report is still published by its own run.
 

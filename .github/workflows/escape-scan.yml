@@ -11,6 +11,7 @@
 # Setup (Settings → Secrets and variables → Actions → Repository):
 #   Secret    ESCAPE_API_KEY       (required) Escape public API key
 #   Variable  ESCAPE_PROFILE_ID    (required) profile to scan
+#   Variable  ESCAPE_GENERATE_PDF  (optional) true (default) | false — have Escape generate the PDF report
 #   Variable  ESCAPE_FAIL_ON       (optional) critical | high | medium | low | info — marks this run failed
 #                                  when open findings reach it (the deployment itself is never blocked)
 
@@ -40,6 +41,10 @@ on:
         type: choice
         options: [default, none, critical, high, medium, low, info]
         default: default
+      generate_pdf:
+        description: "Have Escape generate the PDF report (unchecked = skip it, faster report)"
+        type: boolean
+        default: true
       full:
         description: "Do not truncate descriptions / remediations"
         type: boolean
@@ -84,6 +89,8 @@ jobs:
           START_NEW: ${{ github.event_name == 'workflow_run' || inputs.start_new_scan }}
           FAIL_ON: ${{ (inputs.fail_on == '' || inputs.fail_on == 'default') && vars.ESCAPE_FAIL_ON || inputs.fail_on }}
           FULL: ${{ inputs.full }}
+          # Manual run: the checkbox. Automatic run: the ESCAPE_GENERATE_PDF variable, true when unset
+          ESCAPE_GENERATE_PDF: ${{ github.event_name == 'workflow_dispatch' && inputs.generate_pdf || github.event_name != 'workflow_dispatch' && vars.ESCAPE_GENERATE_PDF != 'false' }}
         run: |
           args=(--output escape-report.md --pdf escape-report.pdf --pdf-timeout "$PDF_TIMEOUT" --no-step-summary
                 --wait --wait-timeout "$WAIT_TIMEOUT")
@@ -113,9 +120,11 @@ jobs:
           PROFILE_ID: ${{ inputs.profile_id }}
           FAIL_ON: ${{ inputs.fail_on || 'default' }}
           FULL: ${{ inputs.full || false }}
+          GENERATE_PDF: ${{ github.event_name == 'workflow_dispatch' && inputs.generate_pdf || github.event_name != 'workflow_dispatch' && vars.ESCAPE_GENERATE_PDF != 'false' }}
         run: |
           gh workflow run escape-scan.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
-            -f scan_id="$SCAN_ID" -f profile_id="$PROFILE_ID" -f fail_on="$FAIL_ON" -f full="$FULL"
+            -f scan_id="$SCAN_ID" -f profile_id="$PROFILE_ID" -f fail_on="$FAIL_ON" -f full="$FULL" \
+            -f generate_pdf="$GENERATE_PDF"
           {
             echo "### ⏳ Escape scan still running"
             echo ""
