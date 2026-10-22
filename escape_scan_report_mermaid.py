@@ -21,10 +21,13 @@ Environment variables (or .env next to the script):
     ESCAPE_PDF_PATH       (optional) same as --pdf: where to save the Escape PDF report
     ESCAPE_PDF_TIMEOUT    (optional) same as --pdf-timeout (seconds, default 600)
     ESCAPE_GENERATE_PDF   (optional) true (default) | false: have Escape generate the PDF report or skip it
+    ESCAPE_ON_RUNNING_SCAN (optional) keep (default) | replace | replace_and_report: what --start-scan does
+                          when a scan of the profile is already running
     GITHUB_STEP_SUMMARY   set by GitHub Actions; the report is appended to the job summary
 
 Exit codes: 0 = OK, 1 = --fail-on threshold reached, 2 = API / usage error,
-            3 = --wait-timeout reached, scan still running (no report), 4 = scan FAILED or CANCELED.
+            3 = --wait-timeout reached, scan still running (no report), 4 = scan FAILED or CANCELED,
+            5 = --start-scan skipped: a scan is already running and ESCAPE_ON_RUNNING_SCAN=keep.
 """
 
 import argparse
@@ -119,6 +122,11 @@ class EscapeAPI:
         req = urllib.request.Request(f"{self.base}{path}", data=json.dumps(body).encode(), method="POST",
                                      headers=dict(self._headers(), **{"Content-Type": "application/json"}))
         return self._send(req, "POST", path)
+
+    def put(self, path, body=None):
+        req = urllib.request.Request(f"{self.base}{path}", data=json.dumps(body or {}).encode(), method="PUT",
+                                     headers=dict(self._headers(), **{"Content-Type": "application/json"}))
+        return self._send(req, "PUT", path)
 
     def _headers(self):
         return {"X-ESCAPE-API-KEY": self.api_key, "Accept": "application/json",
@@ -262,6 +270,76 @@ def wait_scan(api, scan_id, timeout, interval=30):
         if timeout and elapsed + interval > timeout:
             return None
         time.sleep(interval)
+
+
+ON_RUNNING_SCAN = ["keep", "replace", "replace_and_report"]
+
+
+def running_scans(api, profile_id):
+    page = api.get("/scans", {"profileIds": profile_id, "status": ["RUNNING", "STARTING"], "size": 100})
+    return page.get("data") or []
+
+
+def github_api(method, path):
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    req = urllib.request.Request(f"{os.environ.get('GITHUB_API_URL', 'https://api.github.com')}{path}",
+                                 method=method, headers={"Authorization": f"Bearer {token}",
+                                                         "Accept": "application/vnd.github+json",
+                                                         "User-Agent": "escape-scan-report-md/2.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read()
+        return json.loads(body) if body else {}
+
+
+def cancel_waiting_runs(profile_id):
+    """Cancel the other runs of this workflow waiting for a scan of the same profile, so the scan
+    we are about to stop doesn't get a report from them (their run name carries the profile id)."""
+    repo, run_id, ref = (os.environ.get(k) for k in ("GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_WORKFLOW_REF"))
+    if not (in_github_actions() and repo and run_id and ref
+            and (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))):
+        return []
+    workflow = os.path.basename(ref.split("@")[0])
+    canceled = []
+    try:
+        for status in ("in_progress", "queued"):
+            runs = github_api("GET", f"/repos/{repo}/actions/workflows/{workflow}/runs?status={status}&per_page=100")
+            for r in runs.get("workflow_runs", []):
+                if str(r["id"]) != run_id and profile_id in (r.get("display_title") or ""):
+                    github_api("POST", f"/repos/{repo}/actions/runs/{r['id']}/cancel")
+                    canceled.append(r["id"])
+                    print(f"✔ Canceled workflow run {r['id']} that was waiting for the previous scan", file=sys.stderr)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"⚠ Could not cancel the previous workflow runs: {getattr(e, 'reason', e)}", file=sys.stderr)
+    return canceled
+
+
+def start_scan_with_policy(api, profile_id, policy):
+    """Start a scan, applying `policy` when a scan of the profile is already running.
+    Returns (new scan or None when skipped, [ids of the scans stopped])."""
+    running = running_scans(api, profile_id)
+    if running and policy == "keep":
+        ids = ", ".join(r["id"] for r in running)
+        print(f"⏭ A scan is already running ({ids}): keeping it, no new scan (ESCAPE_ON_RUNNING_SCAN=keep)",
+              file=sys.stderr)
+        return None, []
+    stopped = []
+    if running:
+        cancel_waiting_runs(profile_id)
+        for r in running:
+            api.put(f"/scans/{r['id']}/cancel")
+            print(f"✔ Stopping the running scan {r['id']} ({policy})", file=sys.stderr)
+            stopped.append(r["id"])
+        for scan_id in stopped:  # Escape keeps the profile locked until the scan is really canceled
+            if wait_scan(api, scan_id, timeout=300, interval=10) is None:
+                print(f"⚠ Scan {scan_id} not canceled after 5 min, starting the new scan anyway", file=sys.stderr)
+    for attempt in range(4):
+        try:
+            return start_scan(api, profile_id), stopped
+        except APIError as e:
+            if not stopped or attempt == 3:
+                raise
+            print(f"⚠ {e} — retrying in 20 s (profile lock)", file=sys.stderr)
+            time.sleep(20)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -442,6 +520,8 @@ def md_header(d, gate):
             ""]
     if gate:
         out += [f"> {gate}", ""]
+    if d.get("banner"):
+        out += [f"> {d['banner']}", ""]
     return out
 
 
@@ -602,6 +682,59 @@ def build_markdown(d, charts, gate, full):
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
+def write_report(api, args, charts_cls, scan_id, output, pdf_path, fail_on=None, banner=None):
+    """Collect the data of `scan_id`, download its PDF, write the Markdown. Returns (exit code, gate)."""
+    d = collect(api, args.profile, scan_id, args.generate_pdf, args.pdf_timeout)
+    d["banner"] = banner
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+
+    # The PDF is downloaded, never linked from Escape (its signed URL expires after 6h)
+    if d["report"]:
+        url, err = d["report"]
+        saved = None
+        if url:
+            os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+            saved, err = download_pdf(url, pdf_path)
+        if saved:
+            print(f"✔ PDF report saved to {pdf_path}", file=sys.stderr)
+            # In GitHub Actions the PDF is uploaded as an artifact of the run (see the workflow)
+            d["pdf_href"] = (f"{run_url()}#artifacts" if run_url()
+                             else os.path.relpath(pdf_path, os.path.dirname(output)).replace(os.sep, "/"))
+        else:
+            d["pdf_error"] = err
+            print(f"⚠ PDF report not available: {err}", file=sys.stderr)
+
+    gate, code = None, 0
+    if fail_on:
+        threshold = SEVERITIES.index(fail_on.upper())
+        blocking = sum(n for s, n in d["sev_counts"].items()
+                       if s in SEVERITIES and SEVERITIES.index(s) <= threshold)
+        if blocking:
+            gate, code = f"❌ **CI gate failed:** {blocking} open finding(s) at or above **{fail_on.upper()}**", 1
+        else:
+            gate = f"✅ **CI gate passed:** no open finding at or above **{fail_on.upper()}**"
+
+    charts = charts_cls()
+    markdown = build_markdown(d, charts, gate, args.full)
+    with open(output, "w", encoding="utf-8") as f:
+        f.write(markdown)
+    print(f"✔ Report written to {output}", file=sys.stderr)
+    if args.stdout:
+        print(markdown)
+
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary and not args.no_step_summary:
+        body = markdown
+        if len(body.encode()) > GITHUB_SUMMARY_LIMIT and args.full:
+            body = build_markdown(d, charts, gate, False)  # fall back to truncated texts
+        if len(body.encode()) > GITHUB_SUMMARY_LIMIT:
+            body = body.encode()[: GITHUB_SUMMARY_LIMIT - 200].decode(errors="ignore") + \
+                "\n\n> ⚠️ Report truncated to fit GitHub's 1 MiB job summary limit. Full report in the artifact.\n"
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(body + "\n")
+    return code, gate
+
+
 def run(charts_cls, default_output, description):
     load_dotenv(os.path.join(HERE, ".env"))
     load_dotenv(os.path.join(os.getcwd(), ".env"))
@@ -612,6 +745,17 @@ def run(charts_cls, default_output, description):
     parser.add_argument("--scan", help="Report on this scan id instead of the profile's last scan")
     parser.add_argument("--start-scan", action="store_true",
                         help="Start a new scan of the profile first, then report on it (use with --wait)")
+    parser.add_argument("--start-only", action="store_true",
+                        help="With --start-scan: start the scan and exit, without waiting or reporting on it "
+                             "(the scan id goes to the scan_id step output)")
+    parser.add_argument("--on-running-scan", choices=ON_RUNNING_SCAN,
+                        default=os.environ.get("ESCAPE_ON_RUNNING_SCAN") or "keep",
+                        help="With --start-scan, when a scan of the profile is already running: keep it and don't "
+                             "start a new one (default), replace it (stop it, no report), or replace_and_report "
+                             "(stop it, publish its partial report)")
+    parser.add_argument("--stopped-output", metavar="PATH",
+                        help="replace_and_report: Markdown file for the stopped scan's report "
+                             "(default: <output name>-stopped.md)")
     parser.add_argument("--wait", action="store_true",
                         help="Wait for the scan to be FINISHED / FAILED / CANCELED before building the report")
     parser.add_argument("--wait-timeout", type=int, metavar="SECONDS", default=0,
@@ -641,17 +785,42 @@ def run(charts_cls, default_output, description):
         return fail("ESCAPE_API_KEY is not set (environment, CI secret or .env file).")
     if not args.profile:
         return fail("No profile id: set ESCAPE_PROFILE_ID (environment, CI variable or .env) or pass --profile.")
+    if args.start_scan and args.scan:
+        return fail("--start-scan and --scan are mutually exclusive.")
 
+    output = os.path.abspath(args.output)
+    pdf_path = os.path.abspath(args.pdf or os.path.splitext(output)[0] + ".pdf")
     api = EscapeAPI(api_key)
     scan_status = None
     try:
         if args.start_scan:
-            if args.scan:
-                return fail("--start-scan and --scan are mutually exclusive.")
-            scan = start_scan(api, args.profile)
+            scan, stopped = start_scan_with_policy(api, args.profile, args.on_running_scan)
+            set_output("stopped_scan_ids", ",".join(stopped))
+            if scan is None:
+                set_output("skipped", "true")
+                if in_github_actions():
+                    print("::notice title=Escape scan skipped::A scan of this profile is already running: "
+                          "kept it, no new scan (ESCAPE_ON_RUNNING_SCAN=keep)", file=sys.stderr)
+                return 5
             args.scan = scan["id"]
             set_output("scan_id", args.scan)
             print(f"✔ Scan started: {args.scan} ({APP_URL}/scans/{args.scan}/)", file=sys.stderr)
+
+            # replace_and_report: the stopped scan's partial results, published right away
+            if args.on_running_scan == "replace_and_report":
+                base = os.path.splitext(os.path.abspath(args.stopped_output or output))[0]
+                base = base if args.stopped_output else base + "-stopped"
+                for old in stopped:
+                    out_md = base + ".md" if old == stopped[0] else f"{base}-{old[:8]}.md"
+                    write_report(api, args, charts_cls, old, out_md, os.path.splitext(out_md)[0] + ".pdf",
+                                 banner=f"⏹ **Scan stopped** and replaced by scan [`{args.scan}`]"
+                                        f"({APP_URL}/scans/{args.scan}/): partial results, "
+                                        f"up to the moment it was stopped.")
+                if stopped:
+                    set_output("stopped_report", base + ".md")
+            if args.start_only:
+                return 0
+
         if args.wait:
             if not args.scan:
                 profile = api.get(f"/profiles/{args.profile}")
@@ -666,58 +835,10 @@ def run(charts_cls, default_output, description):
                 print(f"⏳ Scan {args.scan} still running after {fmt_duration(args.wait_timeout * 1000)}: "
                       "no report yet (exit 3)", file=sys.stderr)
                 return 3
-        d = collect(api, args.profile, args.scan, args.generate_pdf, args.pdf_timeout)
+
+        code, gate = write_report(api, args, charts_cls, args.scan, output, pdf_path, args.fail_on)
     except APIError as e:
         return fail(str(e))
-
-    output = os.path.abspath(args.output)
-    os.makedirs(os.path.dirname(output), exist_ok=True)
-
-    # The PDF is downloaded, never linked from Escape (its signed URL expires after 6h)
-    if d["report"]:
-        url, err = d["report"]
-        pdf_path = os.path.abspath(args.pdf or os.path.splitext(output)[0] + ".pdf")
-        if url:
-            os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
-            saved, err = download_pdf(url, pdf_path)
-        if url and saved:
-            print(f"✔ PDF report saved to {pdf_path}", file=sys.stderr)
-            # In GitHub Actions the PDF is uploaded as an artifact of the run (see the workflow)
-            d["pdf_href"] = (f"{run_url()}#artifacts" if run_url()
-                             else os.path.relpath(pdf_path, os.path.dirname(output)).replace(os.sep, "/"))
-        else:
-            d["pdf_error"] = err
-            print(f"⚠ PDF report not available: {err}", file=sys.stderr)
-
-    gate, code = None, 0
-    if args.fail_on:
-        threshold = SEVERITIES.index(args.fail_on.upper())
-        blocking = sum(n for s, n in d["sev_counts"].items()
-                       if s in SEVERITIES and SEVERITIES.index(s) <= threshold)
-        if blocking:
-            gate, code = f"❌ **CI gate failed:** {blocking} open finding(s) at or above **{args.fail_on.upper()}**", 1
-        else:
-            gate = f"✅ **CI gate passed:** no open finding at or above **{args.fail_on.upper()}**"
-
-    charts = charts_cls()
-    markdown = build_markdown(d, charts, gate, args.full)
-
-    with open(output, "w", encoding="utf-8") as f:
-        f.write(markdown)
-    print(f"✔ Report written to {output}", file=sys.stderr)
-    if args.stdout:
-        print(markdown)
-
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary and not args.no_step_summary:
-        body = markdown
-        if len(body.encode()) > GITHUB_SUMMARY_LIMIT and args.full:
-            body = build_markdown(d, charts, gate, False)  # fall back to truncated texts
-        if len(body.encode()) > GITHUB_SUMMARY_LIMIT:
-            body = body.encode()[: GITHUB_SUMMARY_LIMIT - 200].decode(errors="ignore") + \
-                "\n\n> ⚠️ Report truncated to fit GitHub's 1 MiB job summary limit. Full report in the artifact.\n"
-        with open(summary, "a", encoding="utf-8") as f:
-            f.write(body + "\n")
 
     if gate:
         plain = re.sub(r"\*\*", "", gate)

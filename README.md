@@ -46,6 +46,9 @@ To preview it like GitHub does, open the file in VS Code with a Mermaid preview 
 | `--profile <uuid>` | Profile to scan / report on (default: `ESCAPE_PROFILE_ID`) |
 | `--scan <uuid>` | Report on this scan instead of the profile's last scan |
 | `--start-scan` | Start a new scan of the profile first (tagged with the CI commit), then report on it |
+| `--start-only` | With `--start-scan`: start the scan and exit, without waiting or reporting on it (the workflow waits in a separate step) |
+| `--on-running-scan <mode>` | With `--start-scan`, when a scan of the profile is already running: `keep` (default), `replace`, `replace_and_report`. Default: `ESCAPE_ON_RUNNING_SCAN` |
+| `--stopped-output <path>` | `replace_and_report`: where to write the stopped scan's report (default: `escape-report-stopped.md`) |
 | `--wait` | Wait until the scan is `FINISHED`, `FAILED` or `CANCELED` before building the report |
 | `--wait-timeout <s>` | Stop waiting after this many seconds and exit `3` without a report (default: no limit) |
 | `--fail-on <severity>` | CI gate: exit `1` if an open finding is at or above `critical`, `high`, `medium`, `low` or `info` |
@@ -57,7 +60,7 @@ To preview it like GitHub does, open the file in VS Code with a Mermaid preview 
 | `--stdout` | Also print the Markdown to stdout |
 | `--no-step-summary` | Don't append to `$GITHUB_STEP_SUMMARY` (the workflow publishes the summary itself) |
 
-Exit codes: `0` OK · `1` `--fail-on` threshold reached · `2` API or usage error · `3` `--wait-timeout` reached, scan still running · `4` scan `FAILED` or `CANCELED` (the report is still built).
+Exit codes: `0` OK · `1` `--fail-on` threshold reached · `2` API or usage error · `3` `--wait-timeout` reached, scan still running · `4` scan `FAILED` or `CANCELED` (the report is still built) · `5` no scan started: one is already running and the mode is `keep`.
 
 ---
 
@@ -111,6 +114,7 @@ In **Settings → Secrets and variables → Actions → Repository** (not *Envir
 |---|---|---|
 | Secret | `ESCAPE_API_KEY` | Escape API key (**required**) |
 | Variable | `ESCAPE_PROFILE_ID` | Profile to scan (**required**) |
+| Variable | `ESCAPE_ON_RUNNING_SCAN` | `keep` (default), `replace` or `replace_and_report`: what to do when a scan of the profile is already running, see below |
 | Variable | `ESCAPE_GENERATE_PDF` | `true` (default when unset) or `false`: have Escape generate the PDF report on automatic runs, or skip it |
 | Variable | `ESCAPE_FAIL_ON` | e.g. `high`: the *Escape scan* run turns red when open findings reach it. Empty = report only |
 
@@ -124,6 +128,7 @@ Permissions used by the workflow: `contents: read`, and `actions: write` to re-d
 |---|---|
 | `scan_id` | Wait for / report on this scan (e.g. a scan started from the Escape UI) |
 | `start_new_scan` | Checked (default): start a new scan. Unchecked: report on the profile's last scan |
+| `on_running_scan` | Override `ESCAPE_ON_RUNNING_SCAN` for this run |
 | `generate_pdf` | Checked (default): Escape generates the PDF report. Unchecked: skip it, the report has no PDF link |
 | `profile_id`, `fail_on`, `full` | Override the repository variables for this run |
 
@@ -136,7 +141,19 @@ Permissions used by the workflow: `contents: read`, and `actions: write` to re-d
 
 If Escape doesn't produce the PDF in time or the download fails, the header says "PDF report n/a" with the reason, and the run continues. When PDF generation is turned off, there's no PDF link and no `escape-report.pdf` artifact, and the report is out in seconds.
 
-> ℹ️ Escape locks a profile while one of its scans is running. If a deployment happens meanwhile, Escape may refuse to start the new scan: that run fails with exit `2` and the Escape error message, and the running scan's report is still published by its own run.
+### A scan is already running when a new deployment arrives
+
+Set `ESCAPE_ON_RUNNING_SCAN` (or the `on_running_scan` input of a manual run):
+
+| Mode | Running scan | New scan | Reports |
+|---|---|---|---|
+| `keep` (default) | continues | not started | the running scan's report, by the run waiting for it. The new run only says "scan not started" |
+| `replace` | stopped | started | only the new scan's report. The run waiting for the stopped scan is canceled, so it publishes nothing |
+| `replace_and_report` | stopped | started | the stopped scan's **partial** report (`escape-report-stopped.pdf`, with a "Scan stopped and replaced" banner), published right away, then the new scan's report in the same run |
+
+In both `replace` modes, the workflow stops the scan in Escape, waits for it to be canceled (Escape locks the profile while a scan runs), and starts the new one, retrying for about a minute if the lock isn't released yet. It finds the run waiting for the old scan by its name, which carries the profile id (`Escape scan · profile <id>`).
+
+A scan started from the Escape UI or by an Escape schedule has no run waiting for it: in `replace` mode that scan is stopped without a report, in `replace_and_report` its partial report is published by the new run.
 
 > ℹ️ GitHub limits a job summary to 1 MiB. Above that, the summary is truncated with a note pointing to the artifact.
 

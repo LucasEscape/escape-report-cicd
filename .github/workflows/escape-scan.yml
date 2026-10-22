@@ -2,20 +2,26 @@
 #
 # Flow: push / merge on main → "Deploy to staging" → this workflow (separate, never blocks the deploy):
 #   1. starts an Escape scan of the profile (tagged with the deployed commit),
-#   2. waits for it (scans take 15 min to 6 h),
+#   2. waits for it (scans take 15 min to 8 h+, the duration can't be predicted),
 #   3. builds the report: job summary + the Escape PDF as the `escape-report.pdf` artifact.
 #
 # A GitHub-hosted job can't run more than 6 h. This job waits up to 5 h 20 min; if the scan is
 # still running, it re-dispatches this workflow with the scan id, and the new run resumes the wait.
 #
 # Setup (Settings → Secrets and variables → Actions → Repository):
-#   Secret    ESCAPE_API_KEY       (required) Escape public API key
-#   Variable  ESCAPE_PROFILE_ID    (required) profile to scan
-#   Variable  ESCAPE_GENERATE_PDF  (optional) true (default) | false — have Escape generate the PDF report
-#   Variable  ESCAPE_FAIL_ON       (optional) critical | high | medium | low | info — marks this run failed
-#                                  when open findings reach it (the deployment itself is never blocked)
+#   Secret    ESCAPE_API_KEY          (required) Escape public API key
+#   Variable  ESCAPE_PROFILE_ID       (required) profile to scan
+#   Variable  ESCAPE_ON_RUNNING_SCAN  (optional) when a scan of the profile is already running:
+#                                       keep (default)      keep it, don't start a new scan
+#                                       replace             stop it, start the new scan, no report for it
+#                                       replace_and_report  stop it, start the new scan, publish its partial report
+#   Variable  ESCAPE_GENERATE_PDF     (optional) true (default) | false — have Escape generate the PDF report
+#   Variable  ESCAPE_FAIL_ON          (optional) critical | high | medium | low | info — marks this run failed
+#                                     when open findings reach it (the deployment itself is never blocked)
 
 name: Escape scan
+# The profile id in the run name lets a "replace" run find and cancel the run waiting for the old scan
+run-name: "Escape scan · profile ${{ inputs.profile_id || vars.ESCAPE_PROFILE_ID }}${{ inputs.scan_id && format(' · scan {0}', inputs.scan_id) || '' }}"
 
 on:
   workflow_run:
@@ -32,6 +38,15 @@ on:
         description: "Start a new scan (ignored when scan_id is set). Unchecked = report on the profile's last scan"
         type: boolean
         default: true
+      on_running_scan:
+        description: "If a scan of the profile is already running"
+        type: choice
+        options: [default, keep, replace, replace_and_report]
+        default: default
+      generate_pdf:
+        description: "Have Escape generate the PDF report (unchecked = skip it, faster report)"
+        type: boolean
+        default: true
       profile_id:
         description: "Escape profile id (empty = ESCAPE_PROFILE_ID variable)"
         required: false
@@ -41,10 +56,6 @@ on:
         type: choice
         options: [default, none, critical, high, medium, low, info]
         default: default
-      generate_pdf:
-        description: "Have Escape generate the PDF report (unchecked = skip it, faster report)"
-        type: boolean
-        default: true
       full:
         description: "Do not truncate descriptions / remediations"
         type: boolean
@@ -52,13 +63,16 @@ on:
 
 permissions:
   contents: read
-  actions: write # re-dispatch this workflow for long scans, delete the previous report artifacts
+  actions: write # re-dispatch for long scans, cancel the run of a replaced scan, delete old report artifacts
 
 env:
   WAIT_TIMEOUT: 19200 # 5 h 20 min of waiting per run, leaves time for the PDF and the uploads
   # Report latency once the scan ends: ≤ 30 s to notice it + data collection (~1-2 min, while Escape
   # renders the PDF) + uploads. The PDF wait is capped so the report is out ≤ ~10 min after the scan.
   PDF_TIMEOUT: 480
+  ESCAPE_PROFILE_ID: ${{ inputs.profile_id || vars.ESCAPE_PROFILE_ID }}
+  # Manual run: the checkbox. Automatic run: the ESCAPE_GENERATE_PDF variable, true when unset
+  ESCAPE_GENERATE_PDF: ${{ github.event_name == 'workflow_dispatch' && inputs.generate_pdf || github.event_name != 'workflow_dispatch' && vars.ESCAPE_GENERATE_PDF != 'false' }}
 
 jobs:
   scan:
@@ -76,29 +90,82 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Start scan, wait for it, build the report
-        id: report
+      # Starts the scan, applying ESCAPE_ON_RUNNING_SCAN if a scan of the profile is already running
+      - name: Start the Escape scan
+        id: start
+        if: inputs.scan_id == '' && (github.event_name == 'workflow_run' || inputs.start_new_scan)
         env:
           ESCAPE_API_KEY: ${{ secrets.ESCAPE_API_KEY }}
-          ESCAPE_PROFILE_ID: ${{ inputs.profile_id || vars.ESCAPE_PROFILE_ID }}
+          ESCAPE_ON_RUNNING_SCAN: ${{ (inputs.on_running_scan == '' || inputs.on_running_scan == 'default') && (vars.ESCAPE_ON_RUNNING_SCAN || 'keep') || inputs.on_running_scan }}
+          GH_TOKEN: ${{ github.token }} # to cancel the run waiting for a replaced scan
           # The deployed commit, attached to the scan in Escape
           ESCAPE_COMMIT_HASH: ${{ github.event.workflow_run.head_sha || github.sha }}
           ESCAPE_COMMIT_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
           ESCAPE_COMMIT_AUTHOR: ${{ github.event.workflow_run.actor.login || github.actor }}
-          SCAN_ID: ${{ inputs.scan_id }}
-          START_NEW: ${{ github.event_name == 'workflow_run' || inputs.start_new_scan }}
+          FULL: ${{ inputs.full }}
+        run: |
+          args=(--start-scan --start-only --output escape-report.md --pdf-timeout "$PDF_TIMEOUT" --no-step-summary)
+          [ "$FULL" = "true" ] && args+=(--full)
+          set +e
+          python3 escape_scan_report_mermaid.py "${args[@]}"
+          code=$?
+          set -e
+          if [ "$code" -eq 5 ]; then
+            {
+              echo "### ⏭ Escape scan not started"
+              echo ""
+              echo "A scan of this profile is already running and \`ESCAPE_ON_RUNNING_SCAN\` is \`keep\`:"
+              echo "it continues, and its report is published by the run waiting for it."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit "$code"
+
+      # replace_and_report: partial report of the stopped scan, published before waiting for the new one
+      - name: Upload stopped scan PDF
+        id: upload_stopped_pdf
+        if: "!cancelled() && hashFiles('escape-report-stopped.pdf') != ''"
+        uses: actions/upload-artifact@v7
+        with:
+          path: escape-report-stopped.pdf
+          archive: false
+          retention-days: 90
+
+      - name: Upload stopped scan Markdown
+        if: "!cancelled() && hashFiles('escape-report-stopped.md') != ''"
+        uses: actions/upload-artifact@v7
+        with:
+          name: escape-report-stopped-markdown
+          path: escape-report-stopped.md
+          retention-days: 90
+
+      - name: Publish stopped scan report
+        if: "!cancelled() && hashFiles('escape-report-stopped.md') != ''"
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PDF_URL: ${{ steps.upload_stopped_pdf.outputs.artifact-url }}
+        run: |
+          if [ -n "$PDF_URL" ]; then
+            sed "s|${RUN_URL}#artifacts|${PDF_URL}|g" escape-report-stopped.md > stopped-summary.md
+          else
+            cp escape-report-stopped.md stopped-summary.md
+          fi
+          head -c 1040000 stopped-summary.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n\n---\n\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for the scan, build the report
+        id: report
+        if: steps.start.outputs.skipped != 'true'
+        env:
+          ESCAPE_API_KEY: ${{ secrets.ESCAPE_API_KEY }}
+          SCAN_ID: ${{ steps.start.outputs.scan_id || inputs.scan_id }}
           FAIL_ON: ${{ (inputs.fail_on == '' || inputs.fail_on == 'default') && vars.ESCAPE_FAIL_ON || inputs.fail_on }}
           FULL: ${{ inputs.full }}
-          # Manual run: the checkbox. Automatic run: the ESCAPE_GENERATE_PDF variable, true when unset
-          ESCAPE_GENERATE_PDF: ${{ github.event_name == 'workflow_dispatch' && inputs.generate_pdf || github.event_name != 'workflow_dispatch' && vars.ESCAPE_GENERATE_PDF != 'false' }}
         run: |
           args=(--output escape-report.md --pdf escape-report.pdf --pdf-timeout "$PDF_TIMEOUT" --no-step-summary
                 --wait --wait-timeout "$WAIT_TIMEOUT")
-          if [ -n "$SCAN_ID" ]; then
-            args+=(--scan "$SCAN_ID")
-          elif [ "$START_NEW" = "true" ]; then
-            args+=(--start-scan)
-          fi
+          # No scan id: manual run with start_new_scan unchecked → the profile's last scan
+          [ -n "$SCAN_ID" ] && args+=(--scan "$SCAN_ID")
           [ -n "$FAIL_ON" ] && [ "$FAIL_ON" != "none" ] && args+=(--fail-on "$FAIL_ON")
           [ "$FULL" = "true" ] && args+=(--full)
 
@@ -120,11 +187,10 @@ jobs:
           PROFILE_ID: ${{ inputs.profile_id }}
           FAIL_ON: ${{ inputs.fail_on || 'default' }}
           FULL: ${{ inputs.full || false }}
-          GENERATE_PDF: ${{ github.event_name == 'workflow_dispatch' && inputs.generate_pdf || github.event_name != 'workflow_dispatch' && vars.ESCAPE_GENERATE_PDF != 'false' }}
         run: |
           gh workflow run escape-scan.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
             -f scan_id="$SCAN_ID" -f profile_id="$PROFILE_ID" -f fail_on="$FAIL_ON" -f full="$FULL" \
-            -f generate_pdf="$GENERATE_PDF"
+            -f generate_pdf="$ESCAPE_GENERATE_PDF"
           {
             echo "### ⏳ Escape scan still running"
             echo ""
@@ -136,7 +202,7 @@ jobs:
       # With archive: false the artifact is named after the file: escape-report.pdf
       - name: Upload PDF report
         id: upload_pdf
-        if: always() && hashFiles('escape-report.pdf') != ''
+        if: "!cancelled() && hashFiles('escape-report.pdf') != ''"
         uses: actions/upload-artifact@v7
         with:
           path: escape-report.pdf
@@ -145,7 +211,7 @@ jobs:
 
       - name: Upload Markdown report
         id: upload_md
-        if: always() && hashFiles('escape-report.md') != ''
+        if: "!cancelled() && hashFiles('escape-report.md') != ''"
         uses: actions/upload-artifact@v7
         with:
           name: escape-report-markdown
@@ -154,7 +220,7 @@ jobs:
 
       # Shown on the run page; the header's PDF link is swapped for the PDF artifact's direct URL
       - name: Publish job summary
-        if: always() && hashFiles('escape-report.md') != ''
+        if: "!cancelled() && hashFiles('escape-report.md') != ''"
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PDF_URL: ${{ steps.upload_pdf.outputs.artifact-url }}
@@ -166,7 +232,7 @@ jobs:
           fi
           # GitHub rejects job summaries above 1 MiB
           if [ "$(wc -c < summary.md)" -gt 1040000 ]; then
-            head -c 1040000 summary.md > "$GITHUB_STEP_SUMMARY"
+            head -c 1040000 summary.md >> "$GITHUB_STEP_SUMMARY"
             printf '\n\n> ⚠️ Report truncated to fit the 1 MiB job summary limit. Full report in the artifact.\n' >> "$GITHUB_STEP_SUMMARY"
           else
             cat summary.md >> "$GITHUB_STEP_SUMMARY"
@@ -174,13 +240,13 @@ jobs:
 
       # Override the old report: keep only this run's artifacts for the branch
       - name: Delete previous reports
-        if: always() && (steps.upload_pdf.outputs.artifact-id != '' || steps.upload_md.outputs.artifact-id != '')
+        if: "!cancelled() && (steps.upload_pdf.outputs.artifact-id != '' || steps.upload_md.outputs.artifact-id != '')"
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
         run: |
-          for name in escape-report.pdf escape-report-markdown; do
+          for name in escape-report.pdf escape-report-markdown escape-report-stopped.pdf escape-report-stopped-markdown; do
             gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${name}&per_page=100" \
               --jq ".artifacts[] | select(.workflow_run.id != ${GITHUB_RUN_ID} and .workflow_run.head_branch == \"${BRANCH}\") | .id" |
             while read -r id; do
